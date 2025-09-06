@@ -11,7 +11,6 @@ from services.rag import rag_recommend
 from config import config
 
 
-API_URL = config.API_URL
 API_TOKEN= config.API_TOKEN
 MODEL_URL = config.MODEL_URL
 MODEL_NAME = config.MODEL_NAME
