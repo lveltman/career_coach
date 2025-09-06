@@ -1,0 +1,4 @@
+asyncio==3.4.3
+gradio==5.44.1
+aiohttp==3.9.3
+tenacity==8.2.3
