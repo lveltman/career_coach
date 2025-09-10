@@ -6,13 +6,14 @@ import json
 import re
 
 from services.model_api import wrapped_get_completion
-from services.rag import rag_recommend
+from backend.rag import rag_recommend
 
 from config import config
 
 
 API_TOKEN= config.API_TOKEN
 MODEL_URL = config.MODEL_URL
+# MODEL_NAME = f"gpt://{config.FOLDER_ID}/{config.MODEL_NAME}" # for deepseek: config.MODEL_NAME
 MODEL_NAME = config.MODEL_NAME
 MODEL_TEMP = config.MODEL_TEMP
 MAX_HISTORY = config.MAX_HISTORY
@@ -119,25 +120,50 @@ async def chatbot_step(user_input, history, current_block):
     if next_block is not None:
         current_block = next_block
 
-    # Логика перехода между блоками
-    if "recommendation" in current_block:
-        response += "\n\n👉 А теперь мои рекомендации."
-
-        # Собираем профиль из истории
-        mock_profile = {
-            "skills": ["Python", "ML", "SQL"]  # пример
-        }
-        recs = rag_recommend(mock_profile)
-        response += "\n\n🎯 Рекомендованные вакансии и треки:"
-        for r in recs:
-            response += f"\n- {r['title']} (Track: {r['track']}, matched skills: {', '.join(r['matched_skills'])})"
-
     print(f"fin response: {response}")
 
     if len(history) > MAX_HISTORY:
         history = history[-MAX_HISTORY:]
 
     history.append({"role": "assistant", "content": response})
+    
+    # Логика перехода между блоками
+    if "recommendation" in current_block:
+        # Собираем профиль из истории    
+        # Тут нужно, чтобы ллм собрала json подобный ответ про юзера в формате, чтобы мы подали этот текст в эмбеддер
+        user_profile_text = f"{user_profile['title']} {user_profile['company']} {', '.join(user_profile['skills'])} {user_profile['experience']} {row['keywords']}"
+        # keywords - это типа требования в вакансиях, вместо этого можно от юзера другую инфу сюда вписывать
+        recommendations, expanded_skills, career_paths = recommend_vacancies(user_profile_text)
+        # надо взять recommendations, expanded_skills, career_paths и user_profile_text оформить в промпт и отправить ллм (вызвать еще раз думаю тут надо)
+        # создаем тут промпт еще один последний        
+        rec_prompt = f"""Ты — карьерный коуч. На основе всех предыдущих блоков и вот этих данных по вакансиям для пользователя: {recommendations}, собранным навыкам для апгрейда: {expanded_skills} и потенциальные карьерные переходам: {career_paths} дай рекомендации. 
+    В конце блока ответь **только в JSON** формате, без дополнительного текста (важно!):
+    
+    {
+      "response": "Объяснение и рекомендации для пользователя",
+      "current_block": recommendation,
+      "recommendation": {
+          "nearest_position": "",
+          "nearest_position_reason": "",
+          "recommended_position": "",
+          "recommended_position_reason": "",
+          "skills_gap": "",
+          "plan_1_2_years": "",
+          "recommended_courses": [],
+          "current_vacancies": []
+      }
+    }"""
+        
+        messages = [{"role": "system", "content": rec_prompt}] + history
+        # response += "\n\n👉 А теперь мои рекомендации."
+
+        llm_raw_output = await wrapped_get_completion(MODEL_URL, API_TOKEN, messages, MODEL_NAME, MODEL_TEMP)
+
+        response, next_block = parse_llm_response(llm_raw_output)
+        # тут достанутся только ее объяснения в response, по идее на основе промпта она должна
+        # вернуть еще поле "recommendation" и его можно распарсить и вернуть юзеру только его или объяснение, хз, надо тестить
+        history[-1] = {"role": "assistant", "content": response}
+
 
     return history, current_block, response
 

@@ -8,6 +8,7 @@ class DefaultPipelineSettings(BaseSettings):
     API_TOKEN: str
     MODEL_URL: str
     MODEL_NAME: str
+    FOLDER_ID: str
     MODEL_TEMP: float
 
     MAX_HISTORY: int

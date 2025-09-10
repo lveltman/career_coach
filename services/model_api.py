@@ -3,7 +3,7 @@ import aiohttp
 import tenacity
 import json
 
-# ==== API вызовы ====
+
 class ModelAPIError(Exception):
     pass
 
@@ -12,6 +12,24 @@ class ModelAPIError(Exception):
     wait=tenacity.wait_exponential(multiplier=1, min=2, max=10),
     retry=tenacity.retry_if_exception_type((aiohttp.ClientError, ModelAPIError))
 )
+
+# Deepseek
+# async def get_completion(url, token, messages, model, temperature=0.7):
+#     headers = {
+#         "Content-Type": "application/json",
+#         "Authorization": f"Bearer {token}"
+#     }
+#     async with aiohttp.ClientSession(headers=headers) as session:
+#         async with session.post(
+#             url=url,
+#             json={"model": model, "messages": messages, "temperature": temperature}
+#         ) as resp:
+#             if resp.status != 200:
+#                 raise ModelAPIError(f"Ошибка API {resp.status}: {await resp.text()}")
+#             response_json = await resp.json()
+#             return response_json["choices"][0]["message"]["content"]
+
+# yandex
 async def get_completion(url, token, messages, model, temperature=0.7):
     headers = {
         "Content-Type": "application/json",
@@ -20,7 +38,17 @@ async def get_completion(url, token, messages, model, temperature=0.7):
     async with aiohttp.ClientSession(headers=headers) as session:
         async with session.post(
             url=url,
-            json={"model": model, "messages": messages, "temperature": temperature}
+            json={"modelUri": model,
+                  "messages": messages,
+                  "completionOptions":
+                                      {"stream": False,
+                                        "temperature": temperature,
+                                        "maxTokens": "2000",
+                                        "reasoningOptions": {
+                                          "mode": "DISABLED"
+                                        }
+                                      }
+                 }
         ) as resp:
             if resp.status != 200:
                 raise ModelAPIError(f"Ошибка API {resp.status}: {await resp.text()}")
@@ -31,4 +59,4 @@ async def wrapped_get_completion(*args, **kwargs):
     try:
         return await get_completion(*args, **kwargs)
     except Exception as e:
-        return f"[Ошибка LLM]: {str(e)}"
+        return f"[Error LLM]: {str(e)}"
