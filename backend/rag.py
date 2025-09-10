@@ -6,8 +6,9 @@ from collections import Counter
 import networkx as nx
 from sentence_transformers import SentenceTransformer
 
+print(f"read vacancies")
 
-df_vacancies = pd.read_parquet('../data_artefacts')
+df_vacancies = pd.read_parquet('./data_artefacts')
 
 
 model = SentenceTransformer('efederici/sentence-bert-base')
@@ -27,15 +28,21 @@ vacancy_texts = [
     for _, row in df_vacancies.iterrows()
 ]
 
+print(f"get embeddings")
+
 vacancy_embeddings = model.encode(vacancy_texts, convert_to_numpy=True).astype("float32")
 vacancy_embeddings /= np.linalg.norm(vacancy_embeddings, axis=1, keepdims=True)
 
+print(f"get embeddings done")
 
 # FAISS индекс
 dim = vacancy_embeddings.shape[1]
 faiss_index = faiss.IndexHNSWFlat(dim, 32)  # HNSW для быстрого поиска
 faiss_index.add(vacancy_embeddings)
 
+print(f"faiss done")
+
+print(f"graph init")
 
 G = nx.DiGraph()
 position_nodes = []
@@ -69,6 +76,8 @@ for i, row in df_vacancies.iterrows():
                 G.add_node(skill, type="skill")
                 G.add_edge(pos_node, skill)  # position → skill
                 G.add_edge(skill, pos_node)  # skill → position
+
+print(f"graph done")
 
 
 def recommend_vacancies(user_text, top_k=5, top_career=1, min_skill_freq=2, top_skills=10):
@@ -123,16 +132,4 @@ def recommend_vacancies(user_text, top_k=5, top_career=1, min_skill_freq=2, top_
     expanded_skills = [s for s, _ in skill_counts.most_common(top_skills) if s in filtered_skills]
 
     return recommendations, expanded_skills, list(career_paths)
-
-user_query = "ML engineer с опытом PyTorch 1 год"
-recs, skills, paths = recommend_vacancies(user_query)
-
-print("Рекомендованные вакансии (ближайшие к user vector через faiss:")
-for r in recs:
-    print(r)
-
-print("\nНавыки для апгрейда (через граф):")
-print(skills)
-
-print("\nПотенциальные карьерные переходы:")
-print(paths)
+    
