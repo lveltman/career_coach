@@ -26,18 +26,18 @@ class VacancySearchEngine:
 
         req_resp = ""
         if "requirement" in row and row["requirement"]:
-            req_resp += row["requirement"]
+            req_resp += row["requirement"].lower()
         if "responsibility" in row and row["responsibility"]:
             if req_resp:
                 req_resp += " "
-            req_resp += row["responsibility"]
+            req_resp += row["responsibility"].lower()
         
         skills = []
         if "skills" in row and row["skills"]:
             if isinstance(row["skills"], str):
                 skills = [skill.strip() for skill in row["skills"].split(",")]
             elif isinstance(row["skills"], list):
-                skills = row["skills"]
+                skills = row["skills"].lower()
         
         experience = ExperienceLevel.NO_EXPERIENCE
         if "experience" in row and row["experience"]:
