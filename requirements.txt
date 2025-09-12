@@ -158,6 +158,7 @@ websocket-client==1.8.0
 
 websockets==12.0
 
+rank-bm25 
+nltk
 
 zipp==3.23.0
-

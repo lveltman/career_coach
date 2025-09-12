@@ -1,17 +1,14 @@
 import re
-import faiss
 import numpy as np
 import pandas as pd
 from collections import Counter
 import networkx as nx
-from sentence_transformers import SentenceTransformer
+from rank_bm25 import BM25Okapi
+from nltk.tokenize import word_tokenize
 
 print(f"read vacancies")
 
 df_vacancies = pd.read_parquet('./data_artefacts')
-
-
-model = SentenceTransformer('efederici/sentence-bert-base')
 
 def normalize_text(text: str) -> str:
     if not isinstance(text, str):
@@ -21,26 +18,33 @@ def normalize_text(text: str) -> str:
     text = re.sub(r"\s+", " ", text)
     return text
 
-vacancy_texts = [
-    normalize_text(
-        f"{row['title']} {row['company']} {', '.join(row['skills'])} {row['experience']} {row['keywords']}"
-    )
-    for _, row in df_vacancies.iterrows()
-]
+def tokenize_text(text: str) -> list:
+    """Токенизация текста для BM25 без использования NLTK"""
+    normalized = normalize_text(text)
+    
+    tokens = re.split(r'[\s\W]+', normalized)
+    
+    # Фильтруем пустые строки и слишком короткие токены
+    tokens = [token for token in tokens if len(token) > 2]
+    return tokens
 
-print(f"get embeddings")
+# Подготовка текстов вакансий
+vacancy_texts = []
+tokenized_corpus = []
 
-vacancy_embeddings = model.encode(vacancy_texts, convert_to_numpy=True).astype("float32")
-vacancy_embeddings /= np.linalg.norm(vacancy_embeddings, axis=1, keepdims=True)
+for _, row in df_vacancies.iterrows():
+    # Объединяем все текстовые поля вакансии
+    full_text = f"{row['title']} {row['company']} {', '.join(row['skills'])} {row['experience']} {row['keywords']}"
+    
+    vacancy_texts.append(normalize_text(full_text))
+    tokenized_corpus.append(tokenize_text(full_text))
 
-print(f"get embeddings done")
+print(f"prepare BM25 index")
 
-# FAISS индекс
-dim = vacancy_embeddings.shape[1]
-faiss_index = faiss.IndexHNSWFlat(dim, 32)  # HNSW для быстрого поиска
-faiss_index.add(vacancy_embeddings)
+# Создание BM25 индекса
+bm25 = BM25Okapi(tokenized_corpus)
 
-print(f"faiss done")
+print(f"BM25 index created")
 
 print(f"graph init")
 
@@ -55,7 +59,7 @@ for i, row in df_vacancies.iterrows():
     G.add_node(pos_node, type="position", vacancy_id=row["vacancy_id"], 
                company=row["company"], experience=row["experience"],
                salary=row["salary_str"], industry=row["industry"],
-               embedding=vacancy_embeddings[i])
+               bm25_index=i)  # Сохраняем индекс для BM25
     
     if row["company"]:
         G.add_node(row["company"], type="company")
@@ -79,22 +83,31 @@ for i, row in df_vacancies.iterrows():
 
 print(f"graph done")
 
-
 def recommend_vacancies(user_text, top_k=5, top_career=1, min_skill_freq=2, top_skills=10):
-    user_vector = model.encode([normalize_text(user_text)], convert_to_numpy=True).astype("float32")
-    user_vector /= np.linalg.norm(user_vector, axis=1, keepdims=True)
-    # Поиск топ-K вакансий по FAISS
-    distances, indices = faiss_index.search(user_vector, top_k)
+    """
+    Рекомендация вакансий на основе BM25
+    """
+    # Токенизируем пользовательский запрос
+    user_tokens = tokenize_text(user_text)
+    
+    # Получаем BM25 скоры для всех документов
+    bm25_scores = bm25.get_scores(user_tokens)
+    
+    # Получаем топ-K индексов с наивысшими скорами
+    top_indices = np.argsort(bm25_scores)[::-1][:top_k]
     
     recommendations = []
     career_paths = set()
     all_neighbor_skills = []
     
-    for idx in indices[0]:
+    for idx in top_indices:
         node = position_nodes[idx]
         n_data = G.nodes[node]
-
+        
         skills = [s for s in G.successors(node) if G.nodes[s]["type"]=="skill"]
+        
+        # BM25 скор как мера релевантности
+        bm25_score = float(bm25_scores[idx])
         
         recommendations.append({
             "title": node,
@@ -102,23 +115,30 @@ def recommend_vacancies(user_text, top_k=5, top_career=1, min_skill_freq=2, top_
             "experience": n_data["experience"],
             "salary": n_data["salary"],
             "industry": n_data["industry"],
-            "skills": skills
+            "skills": skills,
+            "bm25_score": bm25_score,
+            "similarity_score": min(bm25_score / max(bm25_scores), 1.0)  # Нормализованный скор
         })
         
-        # Топ-N похожих позиций через навыки
+        # Поиск похожих позиций через навыки
         for skill in skills:
-            neighbors = [pos for pos in G.successors(skill) if G.nodes[pos]["type"]=="position" and pos != node]
+            neighbors = [pos for pos in G.successors(skill) 
+                        if G.nodes[pos]["type"]=="position" and pos != node]
             if neighbors:
-                # Сортируем по косинусной близости эмбеды
-                neighbor_embeddings = np.array([G.nodes[p]["embedding"] for p in neighbors]).astype("float32")
-                sims = neighbor_embeddings @ user_vector.T
-                # Берем только top_career ближайших соседей
-                top_idx = np.argsort(-sims.ravel())[:top_career]
-                for i in top_idx:
-                    neighbor_pos = neighbors[i]
+                # Для каждого соседа вычисляем BM25 скор относительно пользовательского запроса
+                neighbor_scores = []
+                for neighbor_pos in neighbors:
+                    neighbor_idx = G.nodes[neighbor_pos]["bm25_index"]
+                    neighbor_score = bm25_scores[neighbor_idx]
+                    neighbor_scores.append((neighbor_pos, neighbor_score))
+                
+                # Сортируем по BM25 скору и берем топ
+                neighbor_scores.sort(key=lambda x: x[1], reverse=True)
+                
+                for neighbor_pos, _ in neighbor_scores[:top_career]:
                     career_paths.add(neighbor_pos)
                     
-                    # Вытаскиваем навыки у соседа
+                    # Собираем навыки соседей
                     neighbor_skills = [
                         s for s in G.successors(neighbor_pos) if G.nodes[s]["type"] == "skill"
                     ]
@@ -131,5 +151,50 @@ def recommend_vacancies(user_text, top_k=5, top_career=1, min_skill_freq=2, top_
     # Ограничиваем топ N по частоте
     expanded_skills = [s for s, _ in skill_counts.most_common(top_skills) if s in filtered_skills]
 
-    return recommendations, expanded_skills, list(career_paths)
+    print(f"Итого: {len(recommendations)} рекомендаций, {len(expanded_skills)} навыков, {len(career_paths)} карьерных путей")
     
+    print("\n=== РЕКОМЕНДУЕМЫЕ ВАКАНСИИ ===")
+    for i, rec in enumerate(recommendations, 1):
+        print(f"{i}. {rec['title']}")
+        print(f"   Компания: {rec['company']}")
+        print(f"   Опыт: {rec['experience']}")
+        print(f"   Зарплата: {rec['salary']}")
+        print(f"   Отрасль: {rec['industry']}")
+        print(f"   BM25 Score: {rec['bm25_score']:.3f}")
+        print(f"   Навыки: {', '.join(rec['skills'][:5])}{'...' if len(rec['skills']) > 5 else ''}")
+        print()
+    
+    print("=== РЕКОМЕНДУЕМЫЕ НАВЫКИ ДЛЯ РАЗВИТИЯ ===")
+    for i, skill in enumerate(expanded_skills, 1):
+        print(f"{i}. {skill}")
+    
+    print(f"\n=== ВОЗМОЖНЫЕ КАРЬЕРНЫЕ ПУТИ (топ-10) ===")
+    for i, career in enumerate(list(career_paths)[:10], 1):
+        print(f"{i}. {career}")
+    
+    return recommendations, expanded_skills, list(career_paths)
+
+def get_relevant_vacancies_by_keywords(keywords, top_k=10):
+    """
+    Поиск вакансий по списку ключевых слов
+    """
+    # Объединяем ключевые слова в один запрос
+    query = " ".join(keywords)
+    user_tokens = tokenize_text(query)
+    
+    bm25_scores = bm25.get_scores(user_tokens)
+    top_indices = np.argsort(bm25_scores)[::-1][:top_k]
+    
+    results = []
+    for idx in top_indices:
+        node = position_nodes[idx]
+        n_data = G.nodes[node]
+        
+        results.append({
+            "title": node,
+            "company": n_data["company"],
+            "bm25_score": float(bm25_scores[idx]),
+            "original_text": vacancy_texts[idx]
+        })
+    
+    return results

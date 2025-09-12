@@ -5,6 +5,8 @@ import json
 import os
 import re
 
+DEBUG = os.getenv("DEBUG_LLM", "0") == "1"
+
 class ModelAPIError(Exception):
     pass
 
@@ -109,7 +111,7 @@ async def get_completion(url, token, messages, model, temperature=0.7, folder_id
         "completionOptions": {
             "stream": False,
             "temperature": min(temperature, 0.1), 
-            "maxTokens": "64", 
+            "maxTokens": "1024", 
             "reasoningOptions": {"mode": "DISABLED"},
         },
     }
@@ -124,9 +126,16 @@ async def get_completion(url, token, messages, model, temperature=0.7, folder_id
     
     timeout = aiohttp.ClientTimeout(total=60)
     
+    if DEBUG:
+        print("[LLM][YandexGPT][REQ]", json.dumps(payload, ensure_ascii=False, indent=2))
+    
     async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
         async with session.post(url=url, json=payload) as resp:
             text = await resp.text()
+            
+            if DEBUG:
+                print(f"[LLM][YandexGPT][HTTP] {resp.status}")
+                print(f"[LLM][YandexGPT][RAW] {text[:2000]}")
             
             if resp.status != 200:
                 raise ModelAPIError(f"YandexGPT HTTP {resp.status}: {text}")
@@ -135,6 +144,9 @@ async def get_completion(url, token, messages, model, temperature=0.7, folder_id
                 data = json.loads(text)
             except json.JSONDecodeError:
                 raise ModelAPIError(f"Invalid JSON from YandexGPT: {text[:500]}")
+            
+            if DEBUG:
+                print("[LLM][YandexGPT][PARSED]", data)
 
             # Обработка YandexGPT формата
             if "result" in data:
@@ -148,6 +160,8 @@ async def get_completion(url, token, messages, model, temperature=0.7, folder_id
                     # Специальная очистка для YandexGPT
                     cleaned_text = clean_yandex_hallucination(raw_text)
                     
+                    if DEBUG:
+                        print(f"[LLM][YandexGPT][CLEANED] {cleaned_text}")
                     
                     return cleaned_text if cleaned_text else '{"response": "", "error": "hallucination_cleaned"}'
                 
@@ -166,4 +180,6 @@ async def wrapped_get_completion(*args, **kwargs):
         return await get_completion(*args, **kwargs)
     except Exception as e:
         error_msg = f"[Error YandexGPT]: {str(e)}"
+        if DEBUG:
+            print(error_msg)
         return f'{{"response": "", "error": "{str(e)}"}}'

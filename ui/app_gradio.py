@@ -19,220 +19,336 @@ MODEL_TEMP = config.MODEL_TEMP
 MAX_HISTORY = config.MAX_HISTORY
 
 
-SYSTEM_PROMPT_BLOCKS = {
-    "context": """Ты — карьерный коуч. Сначала собери стартовый контекст:
-- профессиональная сфера
-- текущая должность или позиция
-- опыт работы в годах
-- реализованные проекты
-
-Задавай вопросы по одному и дружелюбно общайся с пользователем. 
-В конце блока (когда задашь вопросы по всем пунктам) ответь **только в JSON** формате, без дополнительного текста (важно!):
-
-{
-  "response": "Текст, который нужно показать пользователю",
-  "current_block": "goals"  # когда блок завершен, иначе оставляй "context"
-}""",
-
-    "goals": """Ты — карьерный коуч. Теперь уточни цели:
-- интересующая сфера и специализация
-- какие активности и функции привлекают
-- амбиции по должности и зарплате
-
-Задавай вопросы по одному, используя данные из блока context.
-
-В конце блока (когда задашь вопросы по всем пунктам) ответь **только в JSON** формате, без дополнительного текста (важно!):
-{
-  "response": "Текст для пользователя",
-  "current_block": "skills"  # когда блок завершен
-}""",
-
-    "skills": """Ты — карьерный коуч. Собери данные о навыках:
-- hard skills и инструменты
-- soft skills
-- образование и курсы
-
-Задавай уточняющие вопросы дружелюбно. 
-В конце блока (когда задашь вопросы по всем пунктам) ответь **только в JSON** формате, без дополнительного текста (важно!):
-
-{
-  "response": "Текст для пользователя",
-  "current_block": "recommendation"  # когда блок завершен
-}""",
-
-    "recommendation": """Ты — карьерный коуч. На основе всех предыдущих блоков дай рекомендации. 
-В конце блока (когда задашь вопросы по всем пунктам) ответь **только в JSON** формате, без дополнительного текста (важно!):
-
-{
-  "response": "Объяснение и рекомендации для пользователя",
-  "current_block": recommendation,
-  "recommendation": {
-      "nearest_position": "",
-      "nearest_position_reason": "",
-      "recommended_position": "",
-      "recommended_position_reason": "",
-      "skills_gap": "",
-      "plan_1_2_years": "",
-      "recommended_courses": [],
-      "current_vacancies": []
-  }
-}""",
-
-    "rag": "Подбери вакансии и треки развития на основе профиля пользователя"
+QUESTION_BLOCKS = {
+    'context': [
+        "Привет! Расскажи, пожалуйста, какая у тебя сейчас должность и в какой сфере ты работаешь?",
+        "Сколько лет у тебя общего опыта работы? А сколько именно в этой сфере/должности?",
+        "Какие проекты ты считаешь самыми значимыми в своей работе?"
+    ],
+    'education': [
+        "Какое у тебя образование? Расскажи про вуз, специальность или курсы, которые были важными.",
+        "Какими профессиональными навыками ты владеешь лучше всего?",
+        "Какие личные качества помогают тебе в работе?",
+        "Какие языки программирования, инструменты или технологии ты чаще всего используешь?"
+    ],
+    'goals': [
+        "Кем ты себя видишь через 1–3 года? Какая должность для тебя была бы следующей целью?",
+        "Какой формат работы тебе ближе — офис, удалёнка или гибрид?",
+        "Какой уровень дохода для тебя комфортный и мотивирующий?",
+        "Что для тебя самое важное при выборе новой работы: стабильность, рост, интересные задачи, свобода, что-то ещё?"
+    ]
 }
 
 
-def parse_llm_response(llm_output):
-    """
-    Принимает строку от LLM и возвращает:
-    - текст для пользователя (fallback к «сырому» тексту, если JSON пуст)
-    - следующий блок (или None, если блок не меняется)
-    """
-    # 1) Пытаемся вытащить JSON-объект
-    data = extract_json(llm_output)
-    response_text = ""
-    next_block = None
+# Системный промпт для валидации ответов
+VALIDATION_PROMPT = """Ты — помощник карьерного коуча. Твоя задача — проверить, ответил ли пользователь на заданный вопрос достаточно информативно.
 
-    if data:
-        response_text = (data.get("response") or "").strip()
-        next_block = data.get("current_block", None)
+ВОПРОС: {question}
+ОТВЕТ ПОЛЬЗОВАТЕЛЯ: {answer}
 
-    # 2) Если JSON есть, но response пустой — берём текст до JSON как fallback
-    if not response_text:
-        # Убираем код-блоки ```...``` и берём префикс до первого { (если есть)
-        text = llm_output
-        # отрежем все блоки ```...```
-        text = re.sub(r"```[\\s\\S]*?```", "", text)
-        # префикс до JSON
-        prefix = text.split("{", 1)[0].strip()
-        # если префикс пуст, вернём весь текст без код-блоков
-        response_text = prefix or text.strip()
+Критерии хорошего ответа:
+- Ответ относится к заданному вопросу
+- Содержит конкретную информацию, а не общие фразы
+- Длина ответа больше 10 символов
+- Не является отказом или уходом от темы
 
-    return response_text, next_block
+Ответь ТОЛЬКО "Да" или "Нет" без дополнительных пояснений."""
 
-def extract_json(llm_output: str):
-    # ищем первый JSON-блок по самой простой скобочной эвристике
-    match = re.search(r'\\{[\\s\\S]*\\}', llm_output)
-    if not match:
-        return {}
-    json_text = match.group(0)
+
+async def validate_answer(question: str, answer: str) -> bool:
+    """Проверяет, подходит ли ответ пользователя к заданному вопросу"""
+    if not answer or len(answer.strip()) < 5:
+        return False
+    
+    validation_prompt = VALIDATION_PROMPT.format(question=question, answer=answer)
+    messages = [{"role": "system", "content": validation_prompt}]
+    
     try:
-        return json.loads(json_text)
-    except json.JSONDecodeError:
-        # иногда попадает хвост после JSON — попробуем «почистить» хвостовые запятые/комментарии,
-        # но по-минимуму просто вернём пусто, чтобы сработал fallback
-        return {}
-
-async def chatbot_step(user_input, history, current_block):
-    
-    history.append({"role": "user", "content": user_input})
-
-    messages = [{"role": "system", "content": SYSTEM_PROMPT_BLOCKS[current_block]}] + history
-
-    llm_raw_output = await wrapped_get_completion(MODEL_URL, API_TOKEN, messages, MODEL_NAME, MODEL_TEMP, folder_id=config.FOLDER_ID)
-    print("[LLM][RAW_INIT]", llm_raw_output)
-
-    response, next_block = parse_llm_response(llm_raw_output)
-        
-    if next_block is not None:
-        current_block = next_block
-
-    print(f"fin response: {response}")
-
-    if len(history) > MAX_HISTORY:
-        history = history[-MAX_HISTORY:]
-
-    history.append({"role": "assistant", "content": response})
-    
-    # Логика перехода между блоками
-    if "recommendation" in current_block:
-        # Собираем профиль из истории    
-        user_profile_json, user_profile_text = process_user_profile_from_history(history)
-        
-        # Получаем рекомендации на основе профиля пользователя
-        recommendations, expanded_skills, career_paths = recommend_vacancies(user_profile_text)
-        # Формируем строгий финальный промпт и передаем компактные данные
-        final_system_prompt = (
-            "Ты — карьерный коуч. Сформируй финальные рекомендации на основе данных пользователя, "
-            "подобранных вакансий, навыков для апгрейда и потенциальных карьерных переходов. "
-            "Отвечай строго ОДНИМ JSON без какого-либо дополнительного текста. Структура ответа:\n\n"
-            "{\n"
-            "  \"response\": \"Краткое объяснение рекомендаций\",\n"
-            "  \"current_block\": \"recommendation\",\n"
-            "  \"recommendation\": {\n"
-            "    \"nearest_position\": \"\",\n"
-            "    \"nearest_position_reason\": \"\",\n"
-            "    \"recommended_position\": \"\",\n"
-            "    \"recommended_position_reason\": \"\",\n"
-            "    \"skills_gap\": \"\",\n"
-            "    \"plan_1_2_years\": \"\",\n"
-            "    \"recommended_courses\": [],\n"
-            "    \"current_vacancies\": []\n"
-            "  }\n"
-            "}"
+        llm_response = await wrapped_get_completion(
+            MODEL_URL, API_TOKEN, messages, MODEL_NAME, 0.3, folder_id=config.FOLDER_ID
         )
-
-        # Собираем компактный пользовательский ввод для модели
-        compact_payload = {
-            "user_profile": user_profile_json,
-            "recommendations": recommendations,
-            "skills_to_develop": expanded_skills,
-            "career_paths": career_paths,
-        }
-
-        final_messages = [
-            {"role": "system", "content": final_system_prompt},
-            {"role": "user", "content": json.dumps(compact_payload, ensure_ascii=False)},
-        ]
-
-        llm_raw_output = await wrapped_get_completion(MODEL_URL, API_TOKEN, messages, MODEL_NAME, MODEL_TEMP, folder_id=config.FOLDER_ID)
-        print("[LLM][RAW_FINAL]", llm_raw_output)
-
-        # Парсим полный JSON-ответ и сохраняем его в историю как последний элемент
-        final_json = extract_json(llm_raw_output)
-        # Если парсинг не удался, хотя бы вернем сырое содержимое
-        content_for_history = json.dumps(final_json, ensure_ascii=False) if final_json else llm_raw_output
-        history[-1] = {"role": "assistant", "content": content_for_history}
-        # Для совместимости вернем тот же контент наружу
-        response = content_for_history
+        
+        # Проверяем, содержит ли ответ "Да"
+        return "да" in llm_response.lower().strip()[:10]
+    
+    except Exception as e:
+        print(f"Ошибка валидации: {e}")
+        # В случае ошибки считаем ответ валидным, чтобы не блокировать пользователя
+        return True
 
 
-    return history, current_block, response
+def get_current_question(current_block: str, question_index: int) -> str:
+    """Возвращает текущий вопрос для блока"""
+    questions = QUESTION_BLOCKS.get(current_block, [])
+    if question_index < len(questions):
+        return questions[question_index]
+    return None
 
 
-def sync_chatbot(user_input, history, current_block):
-    history, current_block, response = asyncio.run(chatbot_step(user_input, history, current_block))
-    return history, history, current_block, ""
+def get_next_block_and_question(current_block: str, question_index: int):
+    """Определяет следующий блок и вопрос"""
+    questions = QUESTION_BLOCKS.get(current_block, [])
+    
+    # Если есть еще вопросы в текущем блоке
+    if question_index + 1 < len(questions):
+        return current_block, question_index + 1
+    
+    # Переход к следующему блоку
+    block_order = list(QUESTION_BLOCKS.keys())
+    current_block_index = block_order.index(current_block) if current_block in block_order else -1
+    
+    if current_block_index + 1 < len(block_order):
+        next_block = block_order[current_block_index + 1]
+        return next_block, 0
+    
+    # Все блоки пройдены
+    return "recommendation", 0
+
+
+async def chatbot_step(user_input, history, current_block, question_index, waiting_for_answer):
+    
+    # Если ждем ответ на конкретный вопрос
+    if waiting_for_answer:
+        current_question = get_current_question(current_block, question_index)
+        
+        if current_question:
+            # Валидируем ответ
+            is_valid = await validate_answer(current_question, user_input)
+            
+            if not is_valid:
+                # Ответ не подходит, просим еще раз
+                response = f"Пожалуйста, ответь более подробно на вопрос: {current_question}"
+                history.append({"role": "user", "content": user_input})
+                history.append({"role": "assistant", "content": response})
+                return history, current_block, question_index, True, response
+            
+            # Ответ подходит, сохраняем и переходим дальше
+            history.append({"role": "user", "content": user_input})
+            
+            # Определяем следующий блок/вопрос
+            next_block, next_question_index = get_next_block_and_question(current_block, question_index)
+            
+            if next_block == "recommendation":
+                print("=" * 60)
+                print("ВСЕ ОТВЕТЫ ПОЛЬЗОВАТЕЛЯ:")
+                print("=" * 60)
+                user_answers = [msg for msg in history if msg["role"] == "user"]
+                for i, answer in enumerate(user_answers, 1):
+                    print(f"{i}. {answer['content']}")
+                print("=" * 60)
+
+                career_goals = f"Сейчас я работаю: {user_answers[0]['content']}, через 1-3 года я бы хотел быть: {user_answers[7]['content']}"
+
+                response = await generate_final_recommendations(history, career_goals)
+                history.append({"role": "assistant", "content": response})
+                return history, next_block, 0, False, response
+            else:
+                # Задаем следующий вопрос
+                next_question = get_current_question(next_block, next_question_index)
+                if next_question:
+                    # Добавляем переходную фразу между блоками
+                    if next_block != current_block:
+                        if next_block == "education":
+                            transition = "Отлично! Теперь расскажи про образование и навыки. "
+                        elif next_block == "goals":
+                            transition = "Понятно! Давай теперь поговорим о твоих карьерных целях. "
+                        else:
+                            transition = ""
+                        response = transition + next_question
+                    else:
+                        response = next_question
+                    
+                    history.append({"role": "assistant", "content": response})
+                    return history, next_block, next_question_index, True, response
+    
+    # Если не ждем ответ (начальное состояние или ошибка)
+    first_question = get_current_question("context", 0)
+    if first_question:
+        history.append({"role": "assistant", "content": first_question})
+        return history, "context", 0, True, first_question
+    
+    return history, current_block, question_index, waiting_for_answer, "Произошла ошибка. Попробуйте начать заново."
+
+
+async def generate_final_recommendations(history, career_goals):
+    """
+    Улучшенная генерация финальных рекомендаций
+    """
+    
+    # Собираем профиль из истории    
+    user_profile_json, user_profile_text = process_user_profile_from_history(history)
+    
+    # Расширяем поисковый запрос контекстом из профиля
+    enhanced_query = f"{career_goals}\n\nДополнительный контекст:\n{user_profile_text}"
+    
+    # Получаем рекомендации на основе расширенного профиля
+    recommendations, expanded_skills, career_paths = recommend_vacancies(
+        career_goals, 
+        top_k=10, 
+        top_career=2,
+        min_skill_freq=2,
+        top_skills=15
+    )
+    
+    if not recommendations:
+        return "К сожалению, не удалось найти подходящие рекомендации. Попробуйте уточнить ваши карьерные цели."
+    
+    # Улучшенный системный промпт
+    final_system_prompt = (
+        "Ты — опытный карьерный коуч, специализирующийся на технических ролях в ML/AI. "
+        "Твоя задача — проанализировать КОНКРЕТНЫЕ найденные вакансии и дать персональные рекомендации.\n\n"
+        
+        "ОБЯЗАТЕЛЬНЫЕ ТРЕБОВАНИЯ:\n"
+        "1. Используй ТОЛЬКО вакансии из списка 'found_positions' - не придумывай новые\n"
+        "2. Упоминай конкретные компании и позиции по названиям\n"
+        "3. Используй навыки из 'skills_to_develop' для планирования развития\n"
+        "4. Рассматривай карьерные пути из 'career_paths'\n\n"
+        
+        "ПРИМЕРЫ ПРАВИЛЬНЫХ ОТВЕТОВ:\n"
+        "✅ 'Рекомендую позицию Senior NLP engineer в Just AI'\n"
+        "✅ 'С Вашим опытом Вам подходит позиция ML Engineer в Сбере'\n"
+        "❌ 'Рекомендую работу в крупной IT-компании' (слишком общее)\n"
+        "❌ 'Советую найти позицию в Google' (компании нет в списке)\n\n"
+        
+        "ФОРМАТ ОТВЕТА (строго JSON):\n"
+        "{\n"
+        "  \"response\": \"Детальный анализ найденных вакансий с конкретными названиями компаний и позиций. Объясни почему именно эти вакансии подходят по целям пользователя. Обязательно упомяни релевантность.\",\n"
+        "  \"recommendation\": {\n"
+        "    \"nearest_position\": \"ТОЧНОЕ название позиции из found_positions с указанием компании\",\n"
+        "    \"nearest_position_reason\": \"Почему именно эта позиция (компания + роль) наиболее подходящая сейчас, укажи релевантность\",\n"
+        "    \"recommended_position\": \"Целевая позиция из found_positions для роста\",\n"
+        "    \"recommended_position_reason\": \"Обоснование выбора с учетом карьерных целей\",\n"
+        "    \"skills_gap\": \"Навыки из skills_to_develop, которые нужно развить для этих позиций\",\n"
+        "    \"plan_1_2_years\": \"План развития на основе найденных вакансий и навыков\",\n"
+        "    \"recommended_courses\": [\"Курсы для развития навыков из skills_to_develop\"],\n"
+        "    \"current_vacancies\": [\"Топ-3 самые подходящие вакансии с компаниями из found_positions\"]\n"
+        "  }\n"
+        "}\n\n"
+        
+        "КРИТИЧЕСКИ ВАЖНО: Не создавай новые вакансии - работай только с предоставленными данными!"
+    )
+
+    # Подготовка данных для модели
+    payload = {
+        "user_profile": user_profile_json,
+        "user_goals": career_goals,
+        "found_positions": [
+            {
+                "title": rec["title"],
+                "company": rec["company"],
+                "experience": rec["experience"],
+                "salary": rec["salary"],
+                "key_skills": rec["skills"][6:],  
+                "relevance_score": rec["similarity_score"]
+            }
+            for rec in recommendations[5:] 
+        ],
+        "skills_to_develop": expanded_skills,
+        "career_paths": career_paths[:5],  # Топ-5 карьерных путей
+    }
+
+    user_message = f"""
+АНАЛИЗИРУЙ СЛЕДУЮЩИЕ ДАННЫЕ И ДАЙ РЕКОМЕНДАЦИИ:
+
+=== МОЙ ПРОФИЛЬ ===
+{user_profile_json}
+
+=== МОИ КАРЬЕРНЫЕ ЦЕЛИ ===
+{career_goals}
+
+=== НАЙДЕННЫЕ ДЛЯ МЕНЯ ВАКАНСИИ (ОБЯЗАТЕЛЬНО используй эти конкретные позиции) ===
+{json.dumps(payload["found_positions"], ensure_ascii=False, indent=2)}
+
+=== НАВЫКИ ДЛЯ РАЗВИТИЯ ===
+{json.dumps(expanded_skills[:15], ensure_ascii=False)}
+
+=== ВОЗМОЖНЫЕ КАРЬЕРНЫЕ ПУТИ ===
+{json.dumps(career_paths[:8], ensure_ascii=False)}
+
+ПРИМЕР ПРАВИЛЬНОГО ОТВЕТА:
+"Рекомендую позицию 'Senior NLP engineer' в компании 'Just AI' как наиболее подходящую..."
+
+ЗАДАЧА: Проанализируй ЭТИ КОНКРЕТНЫЕ вакансии и выбери лучшие для пользователя. Упоминай названия компаний!
+"""
+
+    messages = [
+        {"role": "system", "content": final_system_prompt},
+        {"role": "user", "content": user_message},
+    ]
+
+    try:
+        llm_response = await wrapped_get_completion(
+            MODEL_URL, API_TOKEN, messages, MODEL_NAME, MODEL_TEMP, folder_id=config.FOLDER_ID
+        )
+        
+        # Улучшенное извлечение JSON
+        json_match = re.search(r'\{[\s\S]*\}', llm_response)
+        if json_match:
+            try:
+                result = json.loads(json_match.group(0))
+                
+                # Валидация результата
+                if "response" in result and "recommendation" in result:
+                    return result.get("response", "Рекомендации сформированы успешно!")
+                else:
+                    print(f"[ERROR] Неполный JSON ответ: {result}")
+                    
+            except json.JSONDecodeError as e:
+                print(f"[ERROR] Ошибка парсинга JSON: {e}")
+                print(f"[ERROR] Ответ LLM: {llm_response}")
+        
+        # Если JSON не извлечен, возвращаем как есть
+        return llm_response
+        
+    except Exception as e:
+        print(f"[ERROR] Ошибка при генерации рекомендаций: {e}")
+        return f"Произошла ошибка при генерации рекомендаций: {e}"
+
+
+def sync_chatbot(user_input, history, current_block, question_index, waiting_for_answer):
+    history, current_block, question_index, waiting_for_answer, response = asyncio.run(
+        chatbot_step(user_input, history, current_block, question_index, waiting_for_answer)
+    )
+    return history, history, current_block, question_index, waiting_for_answer, ""
 
 
 def reset_chat():
-    initial_history = [
-        {"role": "assistant", "content": "Привет! Давай начнём. Расскажи, пожалуйста, в какой профессиональной сфере ты сейчас работаешь?"}
-    ]
-    return initial_history, initial_history, "context", ""
-
+    first_question = get_current_question("context", 0)
+    initial_history = [{"role": "assistant", "content": first_question}]
+    return initial_history, initial_history, "context", 0, True, ""
 
 
 with gr.Blocks() as demo:
     gr.Markdown("## 🤖 Career Coach")
+    gr.Markdown("Отвечай на вопросы подробно, чтобы получить персональные карьерные рекомендации!")
 
-    chatbot_ui = gr.Chatbot(value=[
-        {"role": "assistant", "content": "Привет! Давай начнём. Расскажи, пожалуйста, в какой профессиональной сфере ты сейчас работаешь?"}
-    ], type="messages")
+    chatbot_ui = gr.Chatbot(
+        value=[{"role": "assistant", "content": get_current_question("context", 0)}],
+        type="messages"
+    )
 
-    msg = gr.Textbox(label="Ваш ответ:")
+    msg = gr.Textbox(label="Ваш ответ:", placeholder="Введите ваш ответ здесь...")
     reset_btn = gr.Button("🔄 Начать заново")
 
-    history_state = gr.State(value=[
-        {"role": "assistant", "content": "Привет! Давай начнём. Расскажи, пожалуйста, в какой профессиональной сфере ты сейчас работаешь?"}
-    ])
+    # Состояния
+    history_state = gr.State(value=[{"role": "assistant", "content": get_current_question("context", 0)}])
     block_state = gr.State(value="context")
+    question_index_state = gr.State(value=0)
+    waiting_for_answer_state = gr.State(value=True)
     
     # Отправка сообщения
-    msg.submit(sync_chatbot, [msg, history_state, block_state], [chatbot_ui, history_state, block_state, msg])
+    msg.submit(
+        sync_chatbot, 
+        [msg, history_state, block_state, question_index_state, waiting_for_answer_state], 
+        [chatbot_ui, history_state, block_state, question_index_state, waiting_for_answer_state, msg]
+    )
 
     # Кнопка сброса
-    reset_btn.click(reset_chat, [], [chatbot_ui, history_state, block_state, msg])
+    reset_btn.click(
+        reset_chat, 
+        [], 
+        [chatbot_ui, history_state, block_state, question_index_state, waiting_for_answer_state, msg]
+    )
 
 
 demo.launch()
