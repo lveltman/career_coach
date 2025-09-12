@@ -163,3 +163,7 @@ nltk
 zipp==3.23.0
 
 rank_bm25==0.2.2
+
+aiohttp==3.12.15
+
+pydantic-settings==2.10.1
