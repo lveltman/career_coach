@@ -8,7 +8,7 @@ from nltk.tokenize import word_tokenize
 
 print(f"read vacancies")
 
-df_vacancies = pd.read_parquet('./data_artefacts')
+df_vacancies = pd.read_parquet('./data_artefacts/vacancy_final.parquet')
 
 def normalize_text(text: str) -> str:
     if not isinstance(text, str):
@@ -59,6 +59,7 @@ for i, row in df_vacancies.iterrows():
     G.add_node(pos_node, type="position", vacancy_id=row["vacancy_id"], 
                company=row["company"], experience=row["experience"],
                salary=row["salary_str"], industry=row["industry"],
+               requirements=row["keywords"],
                bm25_index=i)  # Сохраняем индекс для BM25
     
     if row["company"]:
@@ -116,6 +117,7 @@ def recommend_vacancies(user_text, top_k=5, top_career=1, min_skill_freq=2, top_
             "salary": n_data["salary"],
             "industry": n_data["industry"],
             "skills": skills,
+            "requirements":n_data["requirements"],
             "bm25_score": bm25_score,
             "similarity_score": min(bm25_score / max(bm25_scores), 1.0)  # Нормализованный скор
         })
@@ -160,6 +162,7 @@ def recommend_vacancies(user_text, top_k=5, top_career=1, min_skill_freq=2, top_
         print(f"   Опыт: {rec['experience']}")
         print(f"   Зарплата: {rec['salary']}")
         print(f"   Отрасль: {rec['industry']}")
+        print(f"   Требования: {rec['requirements']}")
         print(f"   BM25 Score: {rec['bm25_score']:.3f}")
         print(f"   Навыки: {', '.join(rec['skills'][:5])}{'...' if len(rec['skills']) > 5 else ''}")
         print()
